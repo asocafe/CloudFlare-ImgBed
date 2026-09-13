@@ -4,11 +4,12 @@
 export class TelegramAPI {
     constructor(botToken, proxyUrl = '') {
         this.botToken = botToken;
-        this.proxyUrl = proxyUrl;
+        // 后台配置既可能填写域名，也可能误填完整 URL；统一规范化，避免 https://https://...
+        this.proxyUrl = String(proxyUrl || '').trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
         // 如果设置了代理域名，使用代理域名，否则使用官方 API
-        const apiDomain = proxyUrl ? `https://${proxyUrl}` : 'https://api.telegram.org';
+        const apiDomain = this.proxyUrl ? `https://${this.proxyUrl}` : 'https://api.telegram.org';
         this.baseURL = `${apiDomain}/bot${this.botToken}`;
-        this.fileDomain = proxyUrl ? `https://${proxyUrl}` : 'https://api.telegram.org';
+        this.fileDomain = apiDomain;
         this.defaultHeaders = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0"
         };
@@ -23,6 +24,13 @@ export class TelegramAPI {
      * @returns {Promise<Object>} API响应结果
      */
     async sendFile(file, chatId, functionName, functionType, caption = '', fileName = '') {
+        if (!this.botToken) {
+            throw new Error('Telegram Bot Token is missing');
+        }
+        if (!chatId) {
+            throw new Error('Telegram Chat ID is missing');
+        }
+
         const formData = new FormData();
 
         formData.append('chat_id', chatId);
@@ -41,12 +49,20 @@ export class TelegramAPI {
             body: formData
         });
         console.log('Telegram API response:', response.status, response.statusText);
-        if (!response.ok) {
-            throw new Error(`Telegram API error: ${response.statusText}`);
+
+        let responseData = null;
+        try {
+            responseData = await response.json();
+        } catch {
+            // 某些代理可能返回非 JSON 错误页，下面使用 HTTP 状态生成可读错误。
         }
 
-        // 解析响应数据
-        const responseData = await response.json();
+        if (!response.ok || !responseData?.ok) {
+            const description = responseData?.description
+                || `${response.status} ${response.statusText}`.trim()
+                || 'Unknown Telegram API error';
+            throw new Error(`Telegram API error: ${description}`);
+        }
 
         return responseData;
     }
@@ -108,15 +124,24 @@ export class TelegramAPI {
                 headers: this.defaultHeaders,
             });
 
-            const responseData = await response.json();
-            if (responseData.ok) {
-                return responseData.result.file_path;
-            } else {
-                return null;
+            let responseData = null;
+            try {
+                responseData = await response.json();
+            } catch {
+                // 在下面用 HTTP 状态返回可读错误。
             }
+
+            if (!response.ok || !responseData?.ok) {
+                const description = responseData?.description
+                    || `${response.status} ${response.statusText}`.trim()
+                    || 'Unknown Telegram getFile error';
+                throw new Error(`Telegram getFile error: ${description}`);
+            }
+
+            return responseData.result?.file_path || null;
         } catch (error) {
             console.error('Error getting file path:', error.message);
-            return null;
+            throw error;
         }
     }
 
