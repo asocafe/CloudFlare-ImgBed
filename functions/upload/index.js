@@ -440,21 +440,39 @@ async function uploadFileToTelegram(context, fullId, metadata, fileExt, fileName
     const { env, waitUntil, uploadConfig, url, formdata, specifiedChannelName } = context;
     const db = getDatabase(env);
 
-    // 选择一个 Telegram 渠道上传
-    const tgSettings = uploadConfig.telegram;
-    const tgChannels = tgSettings.channels;
-    
+    // 只从已启用且配置完整的 Telegram 渠道中选择，避免残缺的 Telegram_env 抢占后台渠道。
+    const tgSettings = uploadConfig.telegram || {};
+    const configuredChannels = Array.isArray(tgSettings.channels) ? tgSettings.channels : [];
+    const tgChannels = configuredChannels.filter(channel =>
+        channel
+        && channel.enabled !== false
+        && String(channel.botToken || '').trim()
+        && String(channel.chatId || '').trim()
+    );
+
     let tgChannel;
-    // 如果指定了渠道名称，优先使用指定的渠道
+    // 指定渠道名称时必须精确匹配，不再静默回退到其他渠道。
     if (specifiedChannelName) {
-        tgChannel = tgChannels.find(ch => ch.name === specifiedChannelName);
+        tgChannel = tgChannels.find(channel => channel.name === specifiedChannelName);
+        if (!tgChannel) {
+            return createResponse(
+                `Error: Telegram channel "${specifiedChannelName}" was not found, is disabled, or is missing Bot Token/Chat ID`,
+                { status: 400 }
+            );
+        }
     }
-    // 未指定或未找到指定渠道，使用负载均衡或第一个
+
+    // 未指定渠道时，使用负载均衡或第一个完整渠道。
     if (!tgChannel) {
-        tgChannel = tgSettings.loadBalance.enabled ? tgChannels[Math.floor(Math.random() * tgChannels.length)] : tgChannels[0];
+        tgChannel = tgSettings.loadBalance?.enabled
+            ? tgChannels[Math.floor(Math.random() * tgChannels.length)]
+            : tgChannels[0];
     }
     if (!tgChannel) {
-        return createResponse('Error: No Telegram channel provided', { status: 400 });
+        return createResponse(
+            'Error: No enabled Telegram channel with both Bot Token and Chat ID is configured',
+            { status: 400 }
+        );
     }
 
     const tgBotToken = tgChannel.botToken;
@@ -515,18 +533,25 @@ async function uploadFileToTelegram(context, fullId, metadata, fileExt, fileName
     try {
         const response = await telegramAPI.sendFile(formdata.get('file'), tgChatId, sendFunction.url, sendFunction.type);
         const fileInfo = telegramAPI.getFileInfo(response);
+        if (!fileInfo?.file_id) {
+            throw new Error(response?.description || 'Telegram did not return uploaded file information');
+        }
+
         const filePath = await telegramAPI.getFilePath(fileInfo.file_id);
+        if (!filePath) {
+            throw new Error('Telegram uploaded the file but getFile returned no file path');
+        }
+
         const id = fileInfo.file_id;
         // 更新FileSize
-        metadata.FileSize = (fileInfo.file_size / 1024 / 1024).toFixed(2);
+        metadata.FileSize = ((fileInfo.file_size || file.size) / 1024 / 1024).toFixed(2);
 
         // 将响应返回给客户端
         res = buildUploadResponse(context, returnLink);
 
 
-        // 图像审查（使用代理域名或官方域名）
-        const moderateDomain = tgProxyUrl ? `https://${tgProxyUrl}` : 'https://api.telegram.org';
-        const moderateUrl = `${moderateDomain}/file/bot${tgBotToken}/${filePath}`;
+        // 图像审查（复用已规范化的代理域名或官方域名）
+        const moderateUrl = `${telegramAPI.fileDomain}/file/bot${tgBotToken}/${filePath}`;
         metadata.Label = await moderateContent(env, moderateUrl);
 
         // 更新metadata，写入KV数据库
@@ -546,8 +571,9 @@ async function uploadFileToTelegram(context, fullId, metadata, fileExt, fileName
         waitUntil(endUpload(context, fullId, metadata));
 
     } catch (error) {
-        console.log('Telegram upload error:', error.message);
-        res = createResponse('upload error, check your environment params about telegram channel!', { status: 400 });
+        const errorMessage = error?.message || 'Unknown Telegram upload error';
+        console.log('Telegram upload error:', errorMessage);
+        res = createResponse(`Error: Telegram upload failed - ${errorMessage}`, { status: 400 });
     } finally {
         return res;
     }
